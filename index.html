@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Jumping Jack</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden; touch-action: none;
+    font-family: "Press Start 2P", "Courier New", monospace; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  #stage { flex: 1; min-height: 0; position: relative; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+  #controls { display: flex; gap: 10px; padding: 8px 12px calc(12px + env(safe-area-inset-bottom)); }
+  .btn { flex: 1; height: 76px; border-radius: 18px; border: 2px solid #333; background: #111; color: #fff;
+    font: inherit; font-size: 26px; display: flex; align-items: center; justify-content: center; touch-action: none; }
+  .btn.jump { flex: 1.5; background: #0b4d1a; border-color: #2ecc40; font-size: 13px; }
+  .btn.on { background: #2a2a2a; }
+  .btn.jump.on { background: #2ecc40; color: #000; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; padding: 20px; text-align: center; background: rgba(0,0,0,.78); }
+  #overlay.hidden { display: none; }
+  #overlay h1 { margin: 0; font-size: 26px; line-height: 1.35; color: #ff0; text-shadow: 3px 3px 0 #f0f; }
+  #overlay p { margin: 0; font-size: 10px; line-height: 1.8; max-width: 320px; color: #ddd; }
+  #overlay .hint { color: #888; font-size: 8px; }
+  #overlay button { font: inherit; font-size: 14px; padding: 16px 28px; border-radius: 14px; border: 0; background: #2ecc40; color: #000; }
+  #overlay #muteBtn { font-size: 9px; padding: 10px 14px; background: #222; color: #aaa; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="overlay">
+      <h1 id="ovTitle">JUMPING<br>JACK</h1>
+      <p id="ovText">Прыгай сквозь дыры в линиях и доберись до самого верха!<br>Убегай за край экрана — появишься с другой стороны.</p>
+      <button id="playBtn">ИГРАТЬ</button>
+      <button id="muteBtn">ЗВУК: ВКЛ</button>
+      <p class="hint">◀ ▶ — бег, ПРЫЖОК — вверх<br>Клавиатура: стрелки и пробел</p>
+    </div>
+  </div>
+  <div id="controls">
+    <button class="btn" data-k="l">◀</button>
+    <button class="btn jump" data-k="jump">ПРЫЖОК</button>
+    <button class="btn" data-k="r">▶</button>
+  </div>
+</div>
+<script>
+'use strict';
+// ---------- Telegram ----------
+const tg = window.Telegram && window.Telegram.WebApp;
+const inTg = !!(tg && tg.initData);
+const tgv = v => inTg && tg.isVersionAtLeast && tg.isVersionAtLeast(v);
+if (tg) {
+  try { tg.ready(); tg.expand(); } catch (e) {}
+  try { if (tgv('6.1')) { tg.setHeaderColor('#000000'); tg.setBackgroundColor('#000000'); } } catch (e) {}
+  try { if (tgv('7.7')) tg.disableVerticalSwipes(); } catch (e) {}
+}
+function haptic(kind) {
+  if (!tgv('6.1')) return;
+  try {
+    if (kind === 'error' || kind === 'success' || kind === 'warning') tg.HapticFeedback.notificationOccurred(kind);
+    else tg.HapticFeedback.impactOccurred(kind);
+  } catch (e) {}
+}
+
+// ---------- Constants ----------
+const W = 320, H = 384, NL = 8, GAP = 40, TOP = 48, LT = 4, HW = 36;
+const RUN = 85, JUMP_V = 150, FALL_V = 170, MAX_HOLES = 8;
+const lineY = i => TOP + (NL - i) * GAP;           // y of the top surface of line i (0 = ground)
+const PAL = ['#00e5ff', '#ffee00', '#ff3df2', '#3dff5a', '#ff5050', '#ffffff', '#ff9a00'];
+const HAZ = ['🐍', '🚂', '🦅', '👻', '🦆', '🐙', '🚗', '🐝'];
+
+// ---------- Canvas ----------
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const stage = document.getElementById('stage');
+function fit() {
+  const r = stage.getBoundingClientRect();
+  const s = Math.max(0.5, Math.min(r.width / W, r.height / H));
+  const k = Math.max(1, Math.ceil(s * (window.devicePixelRatio || 1)));
+  cv.width = W * k; cv.height = H * k;
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+}
+addEventListener('resize', fit);
+if (tg) try { tg.onEvent('viewportChanged', fit); } catch (e) {}
+fit();
+
+// ---------- Sound ----------
+let ac = null, muted = false;
+function initAudio() {
+  if (!ac) try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  if (ac && ac.state === 'suspended') ac.resume();
+}
+function beep(f1, f2, dur, type = 'square', vol = 0.06, delay = 0) {
+  if (!ac || muted) return;
+  const t = ac.currentTime + delay, o = ac.createOscillator(), g = ac.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f1, t);
+  o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(ac.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+const sfx = {
+  jump: () => beep(300, 800, 0.12),
+  land: () => beep(700, 1100, 0.05, 'square', 0.04),
+  bonk: () => beep(220, 60, 0.18),
+  fall: () => beep(700, 90, 0.35, 'triangle', 0.09),
+  hit:  () => beep(140, 40, 0.3, 'sawtooth'),
+  die:  () => { beep(400, 200, 0.2, 'square', 0.07); beep(300, 100, 0.25, 'square', 0.07, 0.2); beep(200, 50, 0.4, 'square', 0.07, 0.45); },
+  win:  () => [523, 659, 784, 1047].forEach((f, i) => beep(f, f, 0.12, 'square', 0.06, i * 0.1)),
+};
+
+// ---------- Best score (Telegram CloudStorage + localStorage) ----------
+let best = 0;
+try { best = +localStorage.getItem('jj_best') || 0; } catch (e) {}
+if (tgv('6.9')) try { tg.CloudStorage.getItem('best', (err, v) => { if (!err && v) best = Math.max(best, +v || 0); }); } catch (e) {}
+function saveBest() {
+  try { localStorage.setItem('jj_best', String(best)); } catch (e) {}
+  if (tgv('6.9')) try { tg.CloudStorage.setItem('best', String(best)); } catch (e) {}
+}
+
+// ---------- Game state ----------
+let S, phase = 'title';
+const P = {};
+const input = { l: false, r: false, jump: false };
+const rnd = n => Math.floor(Math.random() * n);
+const down = l => (l <= 1 ? NL : l - 1);
+const up = l => (l >= NL ? 1 : l + 1);
+
+function mkHole(dir, avoidLine) {
+  let line;
+  do { line = 1 + rnd(NL); } while (line === avoidLine);
+  return { dir, line, x: Math.random() * W };
+}
+// A hole that runs off one edge continues on the next line from the other edge.
+function segs(h) {
+  const s = [{ line: h.line, a: h.x, b: h.x + HW }];
+  if (h.dir > 0 && h.x + HW > W) s.push({ line: down(h.line), a: h.x - W, b: h.x + HW - W });
+  if (h.dir < 0 && h.x < 0) s.push({ line: up(h.line), a: h.x + W, b: h.x + HW + W });
+  return s;
+}
+function over(h, line, x, m) {
+  for (const s of segs(h)) if (s.line === line && x >= s.a + m && x <= s.b - m) return true;
+  return false;
+}
+function holeAt(line, x, m, skip) {
+  for (const h of S.holes) if (h !== skip && over(h, line, x, m)) return h;
+  return null;
+}
+
+function newState(level) {
+  return { score: 0, level, lives: 5, t: 0, flash: 0, msg: '', msgT: 0, clearT: 0, holes: [], hazards: [] };
+}
+function startLevel() {
+  S.holes = [mkHole(1), mkHole(-1)];
+  S.hazards = [];
+  const n = Math.min(S.level - 1, 7), lines = [1, 2, 3, 4, 5, 6, 7].sort(() => Math.random() - 0.5);
+  for (let i = 0; i < n; i++)
+    S.hazards.push({ line: lines[i], x: Math.random() * W, dir: Math.random() < 0.5 ? -1 : 1, e: HAZ[(S.level + i) % HAZ.length] });
+  Object.assign(P, { x: W / 2, line: 0, y: lineY(0), st: 'stand', t: 0, inv: 0, ign: null, moving: false, checked: false, pass: false });
+  S.msg = 'УРОВЕНЬ ' + S.level; S.msgT = 1.6;
+}
+function newGame() {
+  initAudio();
+  S = newState(1); startLevel();
+  phase = 'play';
+  overlay.classList.add('hidden');
+}
+const holeSpeed = () => 48 + (S.level - 1) * 7;
+const hazSpeed = () => 28 + (S.level - 1) * 4;
+
+function addScore(n) { S.score += n; }
+function stun(t) { P.st = 'stun'; P.t = t; }
+function startFall() { P.st = 'fall'; sfx.fall(); haptic('light'); }
+function hazardHit() {
+  if (P.inv > 0) return false;
+  for (const z of S.hazards) {
+    if (z.line !== P.line) continue;
+    let d = Math.abs(z.x - P.x); d = Math.min(d, W - d);
+    if (d < 13) return true;
+  }
+  return false;
+}
+function loseLife() {
+  S.lives--; S.flash = 0.35; sfx.die(); haptic('error');
+  if (S.lives <= 0) gameOver();
+  else { S.msg = 'ОСТАЛОСЬ ЖИЗНЕЙ: ' + S.lives; S.msgT = 1.4; }
+}
+function levelClear() {
+  phase = 'clear'; S.clearT = 2.4; addScore(100 * S.level); sfx.win(); haptic('success');
+}
+function gameOver() {
+  phase = 'over';
+  const rec = S.score > best;
+  if (rec) { best = S.score; saveBest(); }
+  showOverlay('GAME<br>OVER', `Счёт: ${S.score}<br>Уровень: ${S.level}<br>${rec ? '🏆 НОВЫЙ РЕКОРД!' : 'Рекорд: ' + best}`, 'ЕЩЁ РАЗ');
+}
+
+function update(dt) {
+  S.t += dt;
+  if (S.flash > 0) S.flash -= dt;
+  if (S.msgT > 0) S.msgT -= dt;
+  if (phase === 'clear') {
+    S.clearT -= dt;
+    if (S.clearT <= 0) { S.level++; startLevel(); phase = 'play'; }
+    return;
+  }
+  // holes and hazards move in every phase (title / game over screens are animated)
+  const hs = holeSpeed();
+  for (const h of S.holes) {
+    h.x += h.dir * hs * dt;
+    if (h.dir > 0 && h.x >= W) { h.x -= W; h.line = down(h.line); }
+    if (h.dir < 0 && h.x + HW <= 0) { h.x += W; h.line = up(h.line); }
+  }
+  const zs = hazSpeed();
+  for (const z of S.hazards) z.x = (z.x + z.dir * zs * dt + W) % W;
+  if (phase !== 'play') return;
+
+  if (P.inv > 0) P.inv -= dt;
+  const jump = input.jump; input.jump = false;
+  P.moving = false;
+
+  switch (P.st) {
+    case 'stand': {
+      const mv = (input.r ? 1 : 0) - (input.l ? 1 : 0);
+      if (mv) { P.x = (P.x + mv * RUN * dt + W) % W; P.moving = true; }
+      if (P.ign && !over(P.ign, P.line, P.x, -8)) P.ign = null;
+      if (P.line > 0 && holeAt(P.line, P.x, 6, P.ign)) { startFall(); break; }
+      if (hazardHit()) { stun(1.3); S.flash = 0.12; sfx.hit(); haptic('heavy'); break; }
+      if (jump) { P.st = 'jump'; P.checked = false; P.pass = false; sfx.jump(); }
+      break;
+    }
+    case 'jump': {
+      P.y -= JUMP_V * dt;
+      if (!P.checked && lineY(P.line) - P.y >= GAP - 20) {   // head reaches the line above
+        P.checked = true;
+        const h = holeAt(P.line + 1, P.x, 3, null);
+        if (h) { P.pass = true; P.ign = h; }
+        else { P.st = 'bonk'; S.flash = 0.08; sfx.bonk(); haptic('medium'); }
+      }
+      if (P.pass && P.y <= lineY(P.line + 1)) {
+        P.line++; P.y = lineY(P.line); P.st = 'stand';
+        addScore(5 * S.level); sfx.land(); haptic('light');
+        if (S.holes.length < MAX_HOLES) S.holes.push(mkHole(Math.random() < 0.5 ? 1 : -1, P.line));
+        if (P.line === NL) levelClear();
+      }
+      break;
+    }
+    case 'bonk':
+    case 'fall': {
+      const falling = P.st === 'fall';
+      P.y += FALL_V * dt;
+      if (P.y >= lineY(falling ? P.line - 1 : P.line)) {
+        if (falling) P.line--;
+        P.y = lineY(P.line);
+        stun(falling ? 0.8 : 0.7);
+        if (falling && P.line === 0) loseLife();
+      }
+      break;
+    }
+    case 'stun': {
+      P.t -= dt;
+      if (P.line > 0 && holeAt(P.line, P.x, 6, P.ign)) { startFall(); break; }
+      if (P.t <= 0) { P.st = 'stand'; P.inv = 0.8; }
+      break;
+    }
+  }
+}
+
+// ---------- Drawing ----------
+const COL = { W: '#fff', K: '#000', G: '#2ecc40', D: '#0f4d18', L: '#b6f37a' };
+const FROG_SIT = [
+  '..WW..WW..',
+  '.WKW..WKW.',
+  '.GGGGGGGG.',
+  'GGGDDDDGGG',
+  'GLLLLLLLLG',
+  'GGLLLLLLGG',
+  'GG.GGGG.GG',
+  'G.G....G.G',
+];
+const FROG_JUMP = [
+  '..WW..WW..',
+  '.WKW..WKW.',
+  '.GGGGGGGG.',
+  'GGGDDDDGGG',
+  '.GLLLLLLG.',
+  '..GLLLLG..',
+  '..G....G..',
+  '.G......G.',
+];
+function sprite(spr, x, y, p) {          // x = center, y = bottom
+  const w = spr[0].length * p, h = spr.length * p;
+  const x0 = Math.round(x - w / 2), y0 = Math.round(y - h);
+  for (let r = 0; r < spr.length; r++)
+    for (let c = 0; c < spr[r].length; c++) {
+      const ch = spr[r][c];
+      if (ch === '.') continue;
+      ctx.fillStyle = COL[ch];
+      ctx.fillRect(x0 + c * p, y0 + r * p, p, p);
+    }
+}
+const wrapXs = (x, m) => (x < m ? [x, x + W] : x > W - m ? [x, x - W] : [x]);
+const pad = n => String(n).padStart(6, '0');
+function text(s, x, y, size, color, align = 'left') {
+  ctx.font = `${size}px "Press Start 2P", monospace`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function banner(s, color) {
+  ctx.font = '10px "Press Start 2P", monospace';
+  const w = ctx.measureText(s).width + 20;
+  ctx.fillStyle = '#000'; ctx.fillRect(W / 2 - w / 2, H / 2 - 14, w, 28);
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.strokeRect(W / 2 - w / 2, H / 2 - 14, w, 28);
+  text(s, W / 2, H / 2 + 1, 10, color, 'center');
+}
+
+function draw() {
+  const lc = PAL[(S.level - 1) % PAL.length];
+  const bg = S.flash > 0 ? (Math.floor(S.t * 30) % 2 ? '#552' : '#225') : '#000';
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+
+  // lines with holes punched out
+  ctx.fillStyle = lc;
+  for (let i = 0; i <= NL; i++) ctx.fillRect(0, lineY(i), W, LT);
+  ctx.fillStyle = bg;
+  for (const h of S.holes) for (const s of segs(h)) ctx.fillRect(s.a, lineY(s.line) - 1, s.b - s.a, LT + 2);
+
+  // hazards
+  ctx.font = '16px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  for (const z of S.hazards) for (const x of wrapXs(z.x, 10)) ctx.fillText(z.e, x, lineY(z.line) - 1);
+
+  // player
+  if (phase !== 'title' && !(P.inv > 0 && Math.floor(S.t * 12) % 2)) {
+    const air = P.st === 'jump' || P.st === 'fall' || P.st === 'bonk';
+    const bob = P.moving && Math.floor(S.t * 10) % 2 ? 1 : 0;
+    for (const x of wrapXs(P.x, 12)) {
+      sprite(air ? FROG_JUMP : FROG_SIT, x, P.y - bob, 2);
+      if (P.st === 'stun') {
+        ctx.fillStyle = '#ff0';
+        for (let k = 0; k < 3; k++) {
+          const a = S.t * 7 + k * 2.094;
+          ctx.fillRect(Math.round(x + Math.cos(a) * 10) - 1, Math.round(P.y - 20 + Math.sin(a) * 3), 3, 3);
+        }
+      }
+    }
+  }
+
+  // HUD
+  text('SC ' + pad(S.score), 4, 12, 8, '#fff');
+  text('HI ' + pad(Math.max(best, S.score)), W - 4, 12, 8, '#ff0', 'right');
+  text('LV ' + S.level, 4, 28, 8, lc);
+  for (let i = 0; i < S.lives; i++) sprite(FROG_SIT, W - 10 - i * 14, 34, 1);
+
+  if (phase === 'clear') {
+    if (Math.floor(S.t * 4) % 2) banner('УРОВЕНЬ ' + S.level + ' ПРОЙДЕН!', '#ff0');
+  } else if (phase === 'play' && S.msgT > 0) banner(S.msg, lc);
+}
+
+// ---------- Input ----------
+for (const b of document.querySelectorAll('.btn')) {
+  const k = b.dataset.k;
+  const on = e => { e.preventDefault(); initAudio(); b.classList.add('on'); if (k === 'jump') input.jump = true; else input[k] = true; };
+  const off = e => { e.preventDefault(); b.classList.remove('on'); if (k !== 'jump') input[k] = false; };
+  b.addEventListener('pointerdown', on);
+  b.addEventListener('pointerup', off);
+  b.addEventListener('pointercancel', off);
+  b.addEventListener('pointerleave', off);
+}
+cv.addEventListener('pointerdown', e => { e.preventDefault(); if (phase === 'play') input.jump = true; });
+document.addEventListener('contextmenu', e => e.preventDefault());
+const KEYS = { ArrowLeft: 'l', KeyA: 'l', ArrowRight: 'r', KeyD: 'r' };
+addEventListener('keydown', e => {
+  if (KEYS[e.code]) { input[KEYS[e.code]] = true; e.preventDefault(); }
+  else if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+    e.preventDefault();
+    if (phase === 'play') { if (!e.repeat) input.jump = true; }
+    else if (phase !== 'clear' && !e.repeat) newGame();
+  }
+});
+addEventListener('keyup', e => { if (KEYS[e.code]) input[KEYS[e.code]] = false; });
+
+// ---------- Overlay ----------
+const overlay = document.getElementById('overlay');
+function showOverlay(title, body, btn) {
+  document.getElementById('ovTitle').innerHTML = title;
+  document.getElementById('ovText').innerHTML = body;
+  document.getElementById('playBtn').textContent = btn;
+  overlay.classList.remove('hidden');
+}
+document.getElementById('playBtn').addEventListener('click', newGame);
+document.getElementById('muteBtn').addEventListener('click', e => {
+  muted = !muted; e.target.textContent = muted ? 'ЗВУК: ВЫКЛ' : 'ЗВУК: ВКЛ';
+});
+
+// ---------- Loop ----------
+S = newState(1); startLevel(); S.msgT = 0;
+for (let i = 0; i < 4; i++) S.holes.push(mkHole(i % 2 ? 1 : -1));   // busier title screen
+let last = performance.now(), paused = false;
+document.addEventListener('visibilitychange', () => { paused = document.hidden; last = performance.now(); });
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (!paused) update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
